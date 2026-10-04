@@ -8,10 +8,11 @@ library prefers OS-native AI, then distribution-managed AI, then an explicitly
 configured installed provider. It never silently downloads a model, installs a
 provider, or starts a heavyweight inference service.
 
-> This crate is early `0.x` software. The portable API and fake backend are
-> implemented and tested. The macOS adapter currently implements availability,
-> sessions, text generation, cancellation, and token counting (macOS 26.4+).
-> Remaining native adapters are under active development.
+> This crate is early `0.x` software. The portable API, the fake backend and
+> the OpenAI-compatible adapter are implemented and tested. Adapters exist for
+> Apple Foundation Models (macOS), Windows AI / Phi Silica (Windows) and Ubuntu
+> inference snaps (Linux). The Apple and Windows adapters have not yet been run
+> on hardware that has a model.
 
 ## Installation
 
@@ -72,18 +73,24 @@ capability merely because an API shape exists.
 This table describes functionality in this repository today, not upstream OS
 potential.
 
-| Capability | Apple | Windows | Ubuntu | Other Linux providers | Fake/test backend |
+| Capability | Apple | Windows | Ubuntu inference snaps | `openai_compatible` | Fake/test backend |
 |---|---:|---:|---:|---:|---:|
-| Availability detection | ✓ | planned | planned | planned | ✓ |
-| Text generation | beta | — | — | — | ✓ |
-| Streaming | — | — | — | — | ✓ |
+| Availability detection | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Text generation | beta | beta | ✓ | ✓ | ✓ |
+| Streaming | — | — | ✓ | ✓ | ✓ |
 | Structured output | — | — | — | — | ✓ |
 | Tool calling | — | — | — | — | — |
-| Generative UI (`genui`) | beta | — | — | — | ✓ |
+| Generative UI (`genui`) | beta | beta | ✓ | ✓ | ✓ |
 | Token counting | beta (26.4+) | — | — | — | ✓ |
-| Cancellation | beta | — | — | — | ✓ |
-| Concurrent sessions | beta | — | — | — | ✓ |
-| System-managed model | ✓ | intended | intended | varies | no |
+| Cancellation | beta | beta | ✓ | ✓ | ✓ |
+| Concurrent sessions | beta | beta | ✓ | ✓ | ✓ |
+| Explicit `prepare()` download | — (system) | ✓ | — (snap) | — | — |
+| System-managed model | ✓ | ✓ | ✓ | no | no |
+
+"beta" means the code is built and type-checked on CI but hasn't run against a
+real model on that platform yet.
+
+### Apple
 
 The Apple adapter is a thin Swift C-ABI bridge to `FoundationModels`; it does
 not bundle a model. It compiles to an unavailable fallback with older Apple
@@ -92,15 +99,73 @@ hardware, disabled Apple Intelligence, and a model that is still preparing.
 The hardware integration test is ignored in ordinary CI and can be run with
 `cargo test --test apple_integration -- --ignored` on a configured Mac.
 
-On Linux there is deliberately no fictional universal backend. Provider
-selection will prefer distribution-managed infrastructure such as Canonical
-Inference Snaps, then supported providers already installed by the user.
+### Windows
+
+The Windows adapter calls Phi Silica through the Windows App SDK's
+`Microsoft.Windows.AI.Text.LanguageModel`, the same API flutter_local_ai uses.
+The bindings are generated from Microsoft's metadata
+(`tools/windows-bindings`) and committed, so building needs only the
+`windows-core` crate. No C++ toolchain or NuGet step is needed.
+
+Microsoft gates Phi Silica at runtime, and each gate is reported through
+`availability()`:
+
+- a Copilot+ PC (NPU), or a supported NVIDIA/AMD GPU with current drivers;
+- Windows 11 25H2 or newer;
+- an app with **package identity** that declares the `systemAIModels`
+  capability. An unpackaged process reports `ProviderNotInstalled`. The stable
+  Windows App SDK channel also requires the app to unlock the Limited Access
+  Feature.
+
+When the model isn't installed yet, `availability()` reports `ModelNotReady`.
+Call `model.prepare().await` to let Windows download it, after obtaining the
+user's consent; nothing else ever triggers a download. The API is stateless,
+so the session replays the conversation. `LanguageModelOptions` has no
+output-token limit or seed, so `max_output_tokens` and `seed` are not applied
+on Windows.
+
+### Ubuntu (inference snaps)
+
+On Linux, `detect()` uses [Canonical inference snaps](https://documentation.ubuntu.com/inference-snaps/)
+such as `qwen3`, `gemma3` or `deepseek-r1`. Each one packages a model with an
+engine optimized for the machine, and serves an OpenAI-compatible API on
+localhost:
+
+```sh
+sudo snap install qwen3     # the user installs a model once
+```
+
+Discovery finds installed inference snaps, then reads each one's API URL from
+`<snap> status --format=json`, the documented way to find it. It uses the first
+snap whose service is running, or the one named by `rust_local_ai::inference_snap("qwen3")` or the
+`RUST_LOCAL_AI_INFERENCE_SNAP` environment variable. It never installs a snap,
+starts a service, switches an engine or downloads anything. A stopped service
+is reported as `ModelNotReady`, with the `sudo snap start` command to run.
+
+### Other local providers
+
+`rust_local_ai::openai_compatible(url, model)` uses any local server that
+speaks the OpenAI chat-completions API, such as llama.cpp's `llama-server`,
+Ollama, LM Studio or Foundry Local:
+
+```rust,ignore
+let model = rust_local_ai::openai_compatible("http://localhost:11434/v1", Some("llama3.2"))?;
+```
+
+Only plain `http://` URLs on this machine are accepted (`localhost`,
+`127.0.0.0/8`, `::1`), so prompts never leave it. The client is a small
+built-in HTTP/1.1 implementation with no dependencies. It supports blocking
+and SSE-streamed generation, and keeps the transcript client-side.
+`cancel()`, or dropping the future or stream, aborts the request on the
+socket.
 
 ## Dependencies and runtimes
 
 The crate keeps its dependency tree small. At runtime it uses only `serde`,
 `serde_json`, `futures-core`, `tokio` (with only its `sync` feature) and the
-`async-trait` macro. The `a2ui` feature adds `a2ui-types`.
+`async-trait` macro. On Windows, `windows-core` is added for the Phi Silica
+bindings. The `a2ui` feature adds `a2ui-types`. Local HTTP uses a built-in
+client, not an HTTP crate.
 
 It doesn't need a tokio runtime and works under any async executor. Native
 calls run on their own threads rather than a runtime's blocking pool. Dropping

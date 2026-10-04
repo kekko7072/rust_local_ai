@@ -8,19 +8,17 @@ use std::{
     ffi::{c_char, c_void, CStr, CString},
     ptr,
     sync::Arc,
-    thread,
 };
 
 use async_trait::async_trait;
-use tokio::sync::oneshot;
 
-use super::{Backend, BackendSession, ResponseStream};
+use super::{worker, Backend, BackendSession, ResponseStream};
 use crate::{
     AiResponse, Availability, AvailabilityReason, BackendInfo, BackendKind, Capabilities,
     GenerationConfig, LocalAiError, Result,
 };
 
-unsafe extern "C" {
+extern "C" {
     fn rla_apple_availability(detail: *mut *mut c_char) -> i32;
     fn rla_apple_capabilities() -> u32;
     fn rla_apple_session_create(
@@ -158,23 +156,10 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// Runs a blocking native call on a dedicated thread.
-///
-/// Uses a plain thread and a oneshot channel rather than a runtime's blocking
-/// pool, so the crate works under any async executor.
 async fn run_blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let (sender, receiver) = oneshot::channel();
-    thread::Builder::new()
-        .name("rust_local_ai-apple".into())
-        .spawn(move || {
-            let _ = sender.send(work());
-        })
-        .map_err(|error| backend_error(Some(format!("failed to start worker thread: {error}"))))?;
-    receiver
-        .await
-        .map_err(|_| backend_error(Some("native worker thread panicked".into())))?
+    worker::run_blocking(BackendKind::AppleFoundationModels, work).await
 }
 
 #[async_trait]

@@ -1,14 +1,18 @@
-use futures_util::StreamExt;
+use std::{future::poll_fn, pin::Pin};
 
-use super::{parse::extract_json_object, GenUiModuleSpec, GENUI_INSTRUCTIONS};
-use crate::{GenerationConfig, LocalAiError, LocalAiModel, LocalAiSession, Result};
+use futures_core::Stream;
+
+use serde_json::{json, Value};
+
+use super::{parse_model_output, GenUiModuleSpec, GENUI_BLOCK_TYPES, GENUI_INSTRUCTIONS};
+use crate::{GenerationConfig, LocalAiError, LocalAiModel, LocalAiSession, ResponseFormat, Result};
 
 /// Output budget for one module: enough for 2-4 blocks on small on-device
 /// models.
 pub const GENUI_MAX_OUTPUT_TOKENS: u32 = 900;
 
 /// Steering for one [`LocalAiUiGenerator::generate_module`] call.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenUiOptions {
     /// Design principles the module should respect, e.g.
     /// `"Keep it simple and low-pressure"`.
@@ -19,6 +23,21 @@ pub struct GenUiOptions {
     /// Ask for at most 3 short blocks as minified JSON at a lower temperature.
     /// Improves reliability on the smallest on-device models.
     pub compact: bool,
+    /// Total generations to try when the model's output is not a usable
+    /// module (default 2; 0 is treated as 1). Retries use the compact prompt.
+    /// Errors other than unusable output are returned immediately.
+    pub max_attempts: u8,
+}
+
+impl Default for GenUiOptions {
+    fn default() -> Self {
+        Self {
+            principles: None,
+            language: None,
+            compact: false,
+            max_attempts: 2,
+        }
+    }
 }
 
 /// Turns a natural-language goal into a [`GenUiModuleSpec`] using a local
@@ -61,7 +80,8 @@ impl LocalAiUiGenerator {
     /// progress or preview UI.
     ///
     /// Falls back to a single blocking generation when the backend cannot
-    /// stream or the stream fails before producing any text.
+    /// stream or the stream fails before producing any text. When an attempt
+    /// is retried, the text starts again from empty.
     pub async fn generate_module_with_progress(
         &self,
         goal: &str,
@@ -75,7 +95,7 @@ impl LocalAiUiGenerator {
         &self,
         goal: &str,
         options: &GenUiOptions,
-        on_text: Option<&mut (dyn FnMut(&str) + Send)>,
+        on_text: Option<&mut (dyn FnMut(&str) + Send + '_)>,
     ) -> Result<GenUiModuleSpec> {
         let goal = goal.trim();
         if goal.is_empty() {
@@ -83,29 +103,83 @@ impl LocalAiUiGenerator {
                 "genUI goal must not be empty".into(),
             ));
         }
+        let mut on_text = on_text;
+        let mut last_error = None;
+        for attempt in 0..options.max_attempts.max(1) {
+            // Retries switch to the stricter compact prompt, which small models
+            // follow more reliably.
+            let compact = options.compact || attempt > 0;
+            match self
+                .attempt(goal, options, compact, on_text.as_deref_mut())
+                .await
+            {
+                Err(LocalAiError::InvalidModelOutput(message)) => {
+                    last_error = Some(LocalAiError::InvalidModelOutput(message));
+                }
+                result => return result,
+            }
+        }
+        Err(last_error.expect("at least one attempt ran"))
+    }
+
+    async fn attempt(
+        &self,
+        goal: &str,
+        options: &GenUiOptions,
+        compact: bool,
+        on_text: Option<&mut (dyn FnMut(&str) + Send + '_)>,
+    ) -> Result<GenUiModuleSpec> {
+        let session = self.model.open_session(Some(GENUI_INSTRUCTIONS)).await?;
         let config = GenerationConfig {
             max_output_tokens: Some(GENUI_MAX_OUTPUT_TOKENS),
             // Lower temperature on small models gives more reliable JSON.
-            temperature: Some(if options.compact { 0.2 } else { 0.5 }),
+            temperature: Some(if compact { 0.2 } else { 0.5 }),
+            // Constrained decoding, where the backend offers it, guarantees
+            // well-formed JSON; the parser below still validates it.
+            response_format: if session.capabilities().structured_output {
+                ResponseFormat::JsonSchema(module_json_schema())
+            } else {
+                ResponseFormat::Text
+            },
             ..GenerationConfig::default()
         };
-
-        let session = self.model.open_session(Some(GENUI_INSTRUCTIONS)).await?;
-        let raw = read_text(&session, &build_prompt(goal, options), config, on_text).await;
+        let prompt = build_prompt(goal, options, compact);
+        let raw = read_text(&session, &prompt, config, on_text).await;
         // The session is throwaway; a failed teardown must not discard a
         // module that was generated successfully.
         let _ = session.close().await;
 
-        let value = extract_json_object(&raw?).ok_or_else(|| {
-            LocalAiError::InvalidModelOutput("model did not return a JSON object".into())
-        })?;
-        GenUiModuleSpec::from_json(&value).ok_or_else(|| {
-            LocalAiError::InvalidModelOutput("model JSON is not a valid genUI module".into())
+        parse_model_output(&raw?).ok_or_else(|| {
+            LocalAiError::InvalidModelOutput("no valid genUI module in the model output".into())
         })
     }
 }
 
-fn build_prompt(goal: &str, options: &GenUiOptions) -> String {
+/// JSON Schema for a module, used when the backend supports structured
+/// output. Block fields beyond `type` are left open so every block type fits.
+pub(crate) fn module_json_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "icon": {"type": "string"},
+            "tone": {"type": "string", "enum": ["fern", "apricot", "sky", "lilac"]},
+            "blurb": {"type": "string"},
+            "blocks": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {"type": {"type": "string", "enum": GENUI_BLOCK_TYPES}},
+                    "required": ["type"],
+                },
+            },
+        },
+        "required": ["title", "icon", "tone", "blurb", "blocks"],
+    })
+}
+
+fn build_prompt(goal: &str, options: &GenUiOptions, compact: bool) -> String {
     let mut prompt = format!("Design the Fledge module for this goal: \"{goal}\".");
     if let Some(principles) = options.principles.as_deref().filter(|p| !p.is_empty()) {
         prompt.push_str(&format!(
@@ -118,7 +192,7 @@ fn build_prompt(goal: &str, options: &GenUiOptions) -> String {
         ));
     }
     prompt.push_str("\nReturn ONLY the JSON object.");
-    if options.compact {
+    if compact {
         prompt.push_str(
             " Use at most 3 blocks. Keep every string under 8 words. Output minified JSON \
              on a single line with no spaces after colons or commas, and no trailing commas.",
@@ -131,7 +205,7 @@ async fn read_text(
     session: &LocalAiSession,
     prompt: &str,
     config: GenerationConfig,
-    on_text: Option<&mut (dyn FnMut(&str) + Send)>,
+    on_text: Option<&mut (dyn FnMut(&str) + Send + '_)>,
 ) -> Result<String> {
     session.add_query_chunk(prompt).await?;
     if let Some(on_text) = on_text {
@@ -139,7 +213,8 @@ async fn read_text(
             let mut text = String::new();
             match session.generate_stream(config.clone()).await {
                 Ok(mut stream) => {
-                    while let Some(chunk) = stream.next().await {
+                    while let Some(chunk) = poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await
+                    {
                         match chunk {
                             Ok(chunk) => {
                                 text.push_str(&chunk);
@@ -174,7 +249,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_optional_steering() {
-        let plain = build_prompt("Save $500", &GenUiOptions::default());
+        let plain = build_prompt("Save $500", &GenUiOptions::default(), false);
         assert_eq!(
             plain,
             "Design the Fledge module for this goal: \"Save $500\".\nReturn ONLY the JSON object."
@@ -184,11 +259,22 @@ mod tests {
             &GenUiOptions {
                 principles: Some("Keep it simple".into()),
                 language: Some("Italian".into()),
-                compact: true,
+                ..GenUiOptions::default()
             },
+            true,
         );
         assert!(steered.contains("guiding principles: Keep it simple."));
         assert!(steered.contains("in Italian."));
         assert!(steered.ends_with("and no trailing commas."));
+    }
+
+    #[test]
+    fn json_schema_lists_every_block_type() {
+        let schema = module_json_schema();
+        assert_eq!(schema["type"], "object");
+        let types = schema["properties"]["blocks"]["items"]["properties"]["type"]["enum"]
+            .as_array()
+            .unwrap();
+        assert_eq!(types.len(), GENUI_BLOCK_TYPES.len());
     }
 }

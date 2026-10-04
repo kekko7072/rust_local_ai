@@ -8,9 +8,11 @@ use std::{
     ffi::{c_char, c_void, CStr, CString},
     ptr,
     sync::Arc,
+    thread,
 };
 
 use async_trait::async_trait;
+use tokio::sync::oneshot;
 
 use super::{Backend, BackendSession, ResponseStream};
 use crate::{
@@ -108,26 +110,71 @@ impl Backend for AppleBackend {
         if handle.is_null() {
             return Err(backend_error(take_string(error)));
         }
-        Ok(Arc::new(AppleSession { handle }))
+        Ok(Arc::new(AppleSession {
+            handle: Arc::new(SessionHandle(handle)),
+        }))
     }
 }
 
 struct AppleSession {
-    handle: *mut c_void,
+    handle: Arc<SessionHandle>,
 }
 
-// SAFETY: the Swift object serializes mutable prompt/task state with NSLock;
-// Foundation Models sessions are Sendable, and the Rust session lease prevents
-// concurrent generation calls on one handle.
-unsafe impl Send for AppleSession {}
-// SAFETY: same synchronization and generation-lease invariant as above.
-unsafe impl Sync for AppleSession {}
+/// Owns one retained Swift session. Blocking native calls hold a clone of the
+/// `Arc`, so the session cannot be destroyed while Swift is still using it,
+/// even if the Rust future awaiting the call is dropped.
+struct SessionHandle(*mut c_void);
 
-impl Drop for AppleSession {
+// SAFETY: the Swift object serializes mutable prompt/task state with NSLock and
+// is released with thread-safe reference counting. Foundation Models sessions
+// are Sendable and reject overlapping requests with an error. The Rust session
+// lease normally prevents those; an abandoned generation can still be winding
+// down when the next one starts, which Swift reports as a backend error.
+unsafe impl Send for SessionHandle {}
+// SAFETY: same synchronization and generation-lease invariant as above.
+unsafe impl Sync for SessionHandle {}
+
+impl Drop for SessionHandle {
     fn drop(&mut self) {
-        // SAFETY: this is the sole destroy call for the retained handle.
-        unsafe { rla_apple_session_destroy(self.handle) };
+        // SAFETY: this is the sole destroy call for the retained handle, and
+        // no native call can be running: each one holds an `Arc` clone.
+        unsafe { rla_apple_session_destroy(self.0) };
     }
+}
+
+/// Cancels the native generation if the awaiting future is dropped before it
+/// completes, so an abandoned request does not keep the model busy.
+struct CancelOnDrop {
+    handle: Arc<SessionHandle>,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: the session handle is kept live by `self.handle`.
+            unsafe { rla_apple_session_cancel(self.handle.0) };
+        }
+    }
+}
+
+/// Runs a blocking native call on a dedicated thread.
+///
+/// Uses a plain thread and a oneshot channel rather than a runtime's blocking
+/// pool, so the crate works under any async executor.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (sender, receiver) = oneshot::channel();
+    thread::Builder::new()
+        .name("rust_local_ai-apple".into())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .map_err(|error| backend_error(Some(format!("failed to start worker thread: {error}"))))?;
+    receiver
+        .await
+        .map_err(|_| backend_error(Some("native worker thread panicked".into())))?
 }
 
 #[async_trait]
@@ -136,7 +183,7 @@ impl BackendSession for AppleSession {
         let chunk = CString::new(chunk)
             .map_err(|_| LocalAiError::InvalidConfig("query contains a NUL byte".into()))?;
         // SAFETY: the session is live and the string is valid for this call.
-        if unsafe { rla_apple_session_add(self.handle, chunk.as_ptr()) } == 0 {
+        if unsafe { rla_apple_session_add(self.handle.0, chunk.as_ptr()) } == 0 {
             Ok(())
         } else {
             Err(backend_error(None))
@@ -144,19 +191,24 @@ impl BackendSession for AppleSession {
     }
 
     async fn generate(&self, config: GenerationConfig) -> Result<AiResponse> {
-        let handle = self.handle as usize;
         let temperature = config.temperature.map_or(-1.0, f64::from);
         let top_p = config.top_p.map_or(-1.0, f64::from);
         let maximum_tokens = config
             .max_output_tokens
             .map_or(-1, |value| i32::try_from(value).unwrap_or(i32::MAX));
-        tokio::task::spawn_blocking(move || {
+        let handle = self.handle.clone();
+        let mut guard = CancelOnDrop {
+            handle: self.handle.clone(),
+            armed: true,
+        };
+        let result = run_blocking(move || {
             let mut output = ptr::null_mut();
             let mut error = ptr::null_mut();
-            // SAFETY: the Arc-backed session outlives this awaited blocking task.
+            // SAFETY: `handle` keeps the session alive for the whole call, and
+            // the out-pointers are valid locals.
             let code = unsafe {
                 rla_apple_session_generate(
-                    handle as *mut c_void,
+                    handle.0,
                     temperature,
                     top_p,
                     maximum_tokens,
@@ -175,8 +227,9 @@ impl BackendSession for AppleSession {
                 }
             }
         })
-        .await
-        .map_err(|error| backend_error(Some(error.to_string())))?
+        .await;
+        guard.armed = false;
+        result
     }
 
     async fn generate_stream(&self, _: GenerationConfig) -> Result<ResponseStream> {
@@ -187,14 +240,14 @@ impl BackendSession for AppleSession {
 
     async fn cancel(&self) -> Result<()> {
         // SAFETY: session handle remains live through `&self`.
-        unsafe { rla_apple_session_cancel(self.handle) };
+        unsafe { rla_apple_session_cancel(self.handle.0) };
         Ok(())
     }
 
     async fn count_tokens(&self, text: &str) -> Result<u64> {
         let text = CString::new(text)
             .map_err(|_| LocalAiError::InvalidConfig("text contains a NUL byte".into()))?;
-        tokio::task::spawn_blocking(move || {
+        run_blocking(move || {
             let mut output = 0;
             let mut error = ptr::null_mut();
             // SAFETY: input/output pointers are valid for the duration of the call.
@@ -206,7 +259,6 @@ impl BackendSession for AppleSession {
             }
         })
         .await
-        .map_err(|error| backend_error(Some(error.to_string())))?
     }
 
     async fn close(&self) -> Result<()> {

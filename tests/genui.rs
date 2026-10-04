@@ -62,17 +62,64 @@ async fn falls_back_to_blocking_generation_without_streaming() {
 }
 
 #[tokio::test]
+async fn retries_unusable_output_then_succeeds() {
+    let backend = FakeBackend::default();
+    backend.push_response(Ok(AiResponse::text("I cannot help with that.")));
+    backend.push_response(Ok(AiResponse::text(MODULE)));
+    let module = LocalAiUiGenerator::new(backend.model())
+        .generate_module("Save $500", &GenUiOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(module.title, "Weekend trip fund");
+}
+
+#[tokio::test]
+async fn does_not_retry_backend_errors() {
+    let backend = FakeBackend::default();
+    backend.push_response(Err(LocalAiError::Cancelled));
+    backend.push_response(Ok(AiResponse::text(MODULE)));
+    let generator = LocalAiUiGenerator::new(backend.model());
+    assert!(matches!(
+        generator
+            .generate_module("Save $500", &GenUiOptions::default())
+            .await,
+        Err(LocalAiError::Cancelled)
+    ));
+    // The second response was not consumed by a retry.
+    assert!(generator
+        .generate_module("Save $500", &GenUiOptions::default())
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
 async fn reports_invalid_output_empty_goal_and_unavailability() {
     let backend = FakeBackend::default();
     let generator = LocalAiUiGenerator::new(backend.model());
 
-    backend.push_response(Ok(AiResponse::text("I cannot help with that.")));
+    for _ in 0..2 {
+        backend.push_response(Ok(AiResponse::text("I cannot help with that.")));
+    }
     assert!(matches!(
         generator
             .generate_module("x", &GenUiOptions::default())
             .await,
         Err(LocalAiError::InvalidModelOutput(_))
     ));
+
+    // `max_attempts: 0` still makes exactly one attempt: the module queued
+    // behind the bad response is left for the next call.
+    let single = GenUiOptions {
+        max_attempts: 0,
+        ..GenUiOptions::default()
+    };
+    backend.push_response(Ok(AiResponse::text("{}")));
+    backend.push_response(Ok(AiResponse::text(MODULE)));
+    assert!(matches!(
+        generator.generate_module("x", &single).await,
+        Err(LocalAiError::InvalidModelOutput(_))
+    ));
+    assert!(generator.generate_module("x", &single).await.is_ok());
 
     assert!(matches!(
         generator

@@ -66,12 +66,32 @@ pub struct GenUiBlock(Map<String, Value>);
 impl GenUiBlock {
     /// Validates a raw block, returning `None` for non-objects and unknown
     /// block types.
+    ///
+    /// Numeric fields that small models often emit as strings (`"500"`,
+    /// `"$1,200"`) are converted to JSON numbers so renderers can rely on
+    /// their type.
     pub fn from_json(value: Value) -> Option<Self> {
-        let Value::Object(map) = value else {
+        let Value::Object(mut map) = value else {
             return None;
         };
         let block_type = map.get("type").and_then(Value::as_str)?;
-        GENUI_BLOCK_TYPES.contains(&block_type).then_some(Self(map))
+        if !GENUI_BLOCK_TYPES.contains(&block_type) {
+            return None;
+        }
+        match block_type {
+            "amount" => normalize_numbers(&mut map, &["value"]),
+            "progress" => {
+                normalize_numbers(&mut map, &["value", "target"]);
+                if let Some(Value::Array(quick_add)) = map.get_mut("quickAdd") {
+                    quick_add.iter_mut().for_each(normalize_number);
+                }
+            }
+            "list" => normalize_items(&mut map, "rows", &["amount"]),
+            "lessons" => normalize_items(&mut map, "items", &["mins"]),
+            "calc" => normalize_items(&mut map, "inputs", &["value"]),
+            _ => {}
+        }
+        Some(Self(map))
     }
 
     /// The block's `type`, e.g. `"progress"`.
@@ -131,6 +151,50 @@ impl GenUiBlock {
     }
 }
 
+fn normalize_items(map: &mut Map<String, Value>, list: &str, keys: &[&str]) {
+    if let Some(Value::Array(items)) = map.get_mut(list) {
+        for item in items {
+            if let Value::Object(item) = item {
+                normalize_numbers(item, keys);
+            }
+        }
+    }
+}
+
+fn normalize_numbers(map: &mut Map<String, Value>, keys: &[&str]) {
+    for key in keys {
+        if let Some(value) = map.get_mut(*key) {
+            normalize_number(value);
+        }
+    }
+}
+
+/// Converts a numeric string such as `"$1,200"` or `" 42.5 "` to a JSON
+/// number in place. Anything else is left untouched.
+fn normalize_number(value: &mut Value) {
+    let Value::String(text) = value else {
+        return;
+    };
+    let cleaned: String = text
+        .trim()
+        .trim_start_matches('$')
+        .chars()
+        .filter(|c| *c != ',')
+        .collect();
+    let Ok(number) = cleaned.trim().parse::<f64>() else {
+        return;
+    };
+    // Integral values become integers so they display as "120", not "120.0".
+    let converted = if number.fract() == 0.0 && number.abs() < 9_007_199_254_740_992.0 {
+        Some(Value::from(number as i64))
+    } else {
+        serde_json::Number::from_f64(number).map(Value::Number)
+    };
+    if let Some(converted) = converted {
+        *value = converted;
+    }
+}
+
 /// Renders a JSON scalar the way it reads to a user (strings unquoted).
 fn display(value: &Value) -> String {
     match value {
@@ -180,14 +244,9 @@ impl GenUiModuleSpec {
             .unwrap_or_default();
         Some(Self {
             title: truncate_title(title),
-            icon: object
-                .get("icon")
-                .map(display)
-                .unwrap_or_else(|| "sparkles".into()),
+            icon: non_empty(object.get("icon")).unwrap_or_else(|| "sparkles".into()),
             tone,
-            blurb: object
-                .get("blurb")
-                .map(display)
+            blurb: non_empty(object.get("blurb"))
                 .unwrap_or_else(|| "A plan to get this done.".into()),
             blocks,
         })
@@ -294,6 +353,11 @@ impl SummaryKind {
     }
 }
 
+fn non_empty(value: Option<&Value>) -> Option<String> {
+    let text = display(value?).trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
 fn truncate_title(title: String) -> String {
     if title.chars().count() > MAX_TITLE_CHARS {
         let mut short: String = title.chars().take(MAX_TITLE_CHARS - 2).collect();
@@ -326,6 +390,31 @@ mod tests {
         assert_eq!(spec.blurb, "A plan to get this done.");
         assert_eq!(spec.blocks.len(), 1);
         assert_eq!(spec.blocks[0].describe(), "Saved: $120");
+    }
+
+    #[test]
+    fn numeric_strings_become_numbers() {
+        let spec = GenUiModuleSpec::from_json(&json!({
+            "title": "Budget",
+            "icon": "  ",
+            "blurb": "",
+            "blocks": [
+                {"type": "progress", "label": "Fund", "value": "$1,200", "target": " 2500.5 ", "quickAdd": ["10", 25, "lots"]},
+                {"type": "list", "label": "Bills", "rows": [{"name": "Rent", "amount": "900"}, "junk"]},
+                {"type": "note", "text": "123"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(spec.icon, "sparkles");
+        assert_eq!(spec.blurb, "A plan to get this done.");
+        let progress = spec.blocks[0].fields();
+        assert_eq!(progress["value"], json!(1200));
+        assert_eq!(progress["target"], json!(2500.5));
+        assert_eq!(progress["quickAdd"], json!([10, 25, "lots"]));
+        assert_eq!(spec.blocks[0].describe(), "Fund: 1200 of 2500.5");
+        assert_eq!(spec.blocks[1].fields()["rows"][0]["amount"], json!(900));
+        // Free text is never coerced.
+        assert_eq!(spec.blocks[2].fields()["text"], json!("123"));
     }
 
     #[test]

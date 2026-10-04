@@ -96,6 +96,17 @@ On Linux there is deliberately no fictional universal backend. Provider
 selection will prefer distribution-managed infrastructure such as Canonical
 Inference Snaps, then supported providers already installed by the user.
 
+## Dependencies and runtimes
+
+The crate keeps its dependency tree small. At runtime it uses only `serde`,
+`serde_json`, `futures-core`, `tokio` (with only its `sync` feature) and the
+`async-trait` macro. The `a2ui` feature adds `a2ui-types`.
+
+It doesn't need a tokio runtime and works under any async executor. Native
+calls run on their own threads rather than a runtime's blocking pool. Dropping
+a generation future cancels the native generation, and the native session
+stays alive until that call returns.
+
 ## Testing adapters
 
 Enable the `testing` feature to use `rust_local_ai::testing::FakeBackend` in
@@ -138,9 +149,21 @@ let tree = module.to_component_maps();   // renderer-neutral component tree
 A `GenUiModuleSpec` is a stack of typed blocks (`amount`, `progress`,
 `checklist`, `week`, `stat`, `list`, `lessons`, `reminder`, `calc`, `docs`,
 `note`). Each module runs in its own short-lived session, so it does not touch
-ongoing chats. Output goes through a 900-token budget and is validated before
-it is returned. When the model's output is cut off, the parser repairs it where
-it can so a partial module still renders.
+ongoing chats. Generation uses a 900-token budget, and its output is checked in
+several ways before it is returned:
+
+- The parser handles code fences, surrounding prose, trailing commas, stray
+  braces and wrapper objects. It repairs output cut off by the token budget,
+  so a partial module still renders. It never panics and runs in linear time
+  (both are covered by fuzz-style tests).
+- Numbers written as strings (`"$1,200"`) are converted to JSON numbers.
+  Unknown blocks are dropped, and missing fields get defaults.
+- When the output can't be used, generation is retried once with a stricter
+  compact prompt (`GenUiOptions::max_attempts`, default 2). Backend errors and
+  cancellation are returned immediately and never retried.
+- Backends that support structured output are constrained to the module's JSON
+  Schema.
+
 `generate_module_with_progress` streams the raw text as it decodes, for live
 previews.
 

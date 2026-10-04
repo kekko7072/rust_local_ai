@@ -2,25 +2,37 @@ use serde_json::Value;
 
 use super::GenUiModuleSpec;
 
+/// Upper bound on JSON object candidates examined per output, keeping parsing
+/// linear-ish on adversarial input.
+const MAX_CANDIDATES: usize = 32;
+
 /// Parses a model's raw text output into a validated [`GenUiModuleSpec`].
 ///
-/// Extracts the first top-level JSON object, tolerating code fences, leading or
+/// Extracts a top-level JSON object, tolerating code fences, leading or
 /// trailing prose and trailing commas. Output truncated by the token budget is
 /// repaired by cutting at the last completed nested structure and closing the
 /// brackets still open there, so a partially generated module still renders.
-/// Returns `None` when no valid module can be recovered.
+/// If the first object is not a valid module (stray braces in prose, or the
+/// module wrapped in another object), later and nested objects are tried.
+/// Returns `None` when no valid module can be recovered. Never panics.
 pub fn parse_model_output(text: &str) -> Option<GenUiModuleSpec> {
-    GenUiModuleSpec::from_json(&extract_json_object(text)?)
+    let text = strip_code_fences(text.trim());
+    text.match_indices('{')
+        .take(MAX_CANDIDATES)
+        .filter_map(|(start, _)| extract_json_object(&text[start..]))
+        .find_map(|value| GenUiModuleSpec::from_json(&value))
 }
 
-pub(crate) fn extract_json_object(text: &str) -> Option<Value> {
-    let s = strip_code_fences(text.trim());
+/// Extracts the first JSON object in `s`, repairing truncation.
+fn extract_json_object(s: &str) -> Option<Value> {
     let start = s.find('{')?;
 
     let mut close_stack: Vec<char> = Vec::new();
-    // Byte index just past the last completed nested structure, together with
-    // the closers still open at that point.
-    let mut safe_cut: Option<(usize, Vec<char>)> = None;
+    // Byte index just past the last completed nested structure, and the stack
+    // depth there. Every pop records a new cut, so only pushes happen after
+    // the latest one and `close_stack[..depth]` is still the closers that were
+    // open at the cut; recording the depth keeps the scan linear.
+    let mut safe_cut: Option<(usize, usize)> = None;
     let mut in_string = false;
     let mut escape = false;
 
@@ -44,16 +56,16 @@ pub(crate) fn extract_json_object(text: &str) -> Option<Value> {
                 if close_stack.is_empty() {
                     return decode_object(&s[start..=i]);
                 }
-                safe_cut = Some((i + 1, close_stack.clone()));
+                safe_cut = Some((i + 1, close_stack.len()));
             }
             _ => {}
         }
     }
 
     // Unbalanced at end of input: most likely cut off by the output budget.
-    let (end, open) = safe_cut?;
+    let (end, depth) = safe_cut?;
     let mut repaired = s[start..end].to_owned();
-    repaired.extend(open.iter().rev());
+    repaired.extend(close_stack[..depth].iter().rev());
     decode_object(&repaired)
 }
 
@@ -140,5 +152,62 @@ mod tests {
         assert!(parse_model_output("no json here").is_none());
         assert!(parse_model_output(r#"{"title":"#).is_none());
         assert!(parse_model_output(r#"{"title":"x","blocks":[{"type":"bogus"}]}"#).is_none());
+    }
+
+    #[test]
+    fn skips_invalid_candidates_and_unwraps_nested_modules() {
+        let stray = r#"Fill in {placeholder} first. {"title":"Real","blocks":[{"type":"note","text":"ok"}]}"#;
+        assert_eq!(parse_model_output(stray).unwrap().title, "Real");
+        let wrapped = r#"{"module":{"title":"Inner","blocks":[{"type":"note","text":"ok"}]}}"#;
+        assert_eq!(parse_model_output(wrapped).unwrap().title, "Inner");
+    }
+
+    const MODULE: &str = r#"```json
+{"title":"Trip — fund ✈️","icon":"piggy-bank","tone":"sky","blurb":"Save weekly, \"slowly\".",
+ "blocks":[{"type":"amount","label":"Saved","value":120,"prefix":"$"},
+           {"type":"checklist","label":"Steps","items":[{"label":"Open {account}","done":false},{"label":"Automate","done":false}]},
+           {"type":"note","text":"Brackets ] } and commas , inside strings"}]}
+```"#;
+
+    #[test]
+    fn every_truncation_point_is_handled_without_panicking() {
+        assert_eq!(parse_model_output(MODULE).unwrap().blocks.len(), 3);
+        let mut recovered = 0;
+        for (end, _) in MODULE.char_indices() {
+            if let Some(spec) = parse_model_output(&MODULE[..end]) {
+                assert!(!spec.blocks.is_empty());
+                assert_eq!(spec.title, "Trip — fund ✈️");
+                recovered += 1;
+            }
+        }
+        // Once the first block is complete, partial output keeps rendering.
+        assert!(recovered > MODULE.len() / 3, "recovered only {recovered}");
+    }
+
+    #[test]
+    fn arbitrary_input_never_panics() {
+        // Deterministic xorshift so the test needs no dependencies.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let alphabet: Vec<char> = r#"{}[]",:\ `abc0123456789.-$é✈ tn"#.chars().collect();
+        for _ in 0..2_000 {
+            let mut input = String::new();
+            for _ in 0..(state % 120) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                input.push(alphabet[(state % alphabet.len() as u64) as usize]);
+            }
+            let _ = parse_model_output(&input);
+            let _ = parse_model_output(&format!("{MODULE}{input}"));
+            let _ = parse_model_output(&format!("{input}{MODULE}"));
+        }
+    }
+
+    #[test]
+    fn deeply_nested_input_is_rejected_not_overflowed() {
+        let deep = format!(r#"{{"title":"x","blocks":{}"#, "[".repeat(100_000));
+        assert!(parse_model_output(&deep).is_none());
+        let deep_closed = format!("{}{}", "{\"a\":".repeat(50_000), "}".repeat(50_000));
+        assert!(parse_model_output(&deep_closed).is_none());
     }
 }

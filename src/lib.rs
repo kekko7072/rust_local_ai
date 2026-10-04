@@ -20,5 +20,7 @@ pub async fn detect() -> Result<LocalAiModel> {
     Ok(LocalAiModel::from_backend(backend::platform_backend()))
 }
 
+#[cfg(feature = "genui")]
+pub mod genui;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

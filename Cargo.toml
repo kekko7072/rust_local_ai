@@ -10,16 +10,20 @@ repository = "https://github.com/kekko7072/rust_local_ai"
 homepage = "https://vezz.io"
 documentation = "https://docs.rs/rust_local_ai"
 readme = "README.md"
-keywords = ["ai", "local-ai", "on-device", "apple", "windows"]
+keywords = ["ai", "local-ai", "on-device", "genui", "a2ui"]
 categories = ["api-bindings", "os"]
 include = ["src/**", "native/**", "examples/**", "tests/**", "build.rs", "README.md", "LICENSE-*", "Cargo.toml"]
 
 [features]
 default = []
 testing = []
+# Generative UI: turn a goal into a typed-block UI module (flutter_local_ai compatible).
 genui = []
+# Emit genUI modules as typed A2UI v0.9 protocol messages via `a2ui-types`.
+a2ui = ["genui", "dep:a2ui-types"]
 
 [dependencies]
+a2ui-types = { version = "0.1", optional = true }
 async-trait = "0.1"
 futures-core = "0.3"
 futures-util = "0.3"
@@ -36,3 +40,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "genui"
+required-features = ["a2ui"]

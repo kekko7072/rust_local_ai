@@ -3,6 +3,16 @@
 version = 3
 
 [[package]]
+name = "a2ui-types"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76b3948998984293a9f024fe59269cf6a0bff766b097f263a632dfb55cda295e"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -89,6 +99,7 @@ dependencies = [
 name = "rust_local_ai"
 version = "0.1.0"
 dependencies = [
+ "a2ui-types",
  "async-trait",
  "futures-core",
  "futures-util",

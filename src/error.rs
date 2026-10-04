@@ -24,4 +24,6 @@ pub enum LocalAiError {
     },
     #[error("generation was cancelled")]
     Cancelled,
+    #[error("the model output could not be used: {0}")]
+    InvalidModelOutput(String),
 }

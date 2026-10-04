@@ -1,0 +1,18 @@
+# Regenerates src/backend/windows/bindings.rs. Not part of the published crate.
+#
+#   1. Download Microsoft.WindowsAppSDK.AI from NuGet and unzip it:
+#        curl -L -o ai.nupkg https://api.nuget.org/v3-flatcontainer/microsoft.windowsappsdk.ai/2.5.5/microsoft.windowsappsdk.ai.2.5.5.nupkg
+#        unzip ai.nupkg -d ai
+#   2. cargo run --manifest-path tools/windows-bindings/Cargo.toml -- ai/metadata
+[package]
+name = "windows-bindings-generator"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# 0.62.x generates code for windows-core 0.61, which supports Rust 1.74 (the
+# crate's MSRV is 1.75).
+windows-bindgen = "=0.62.1"

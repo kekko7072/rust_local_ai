@@ -40,6 +40,19 @@ impl LocalAiModel {
         self.backend.capabilities().await
     }
 
+    /// Explicitly prepares the model and returns the resulting availability.
+    ///
+    /// On Windows this asks the OS to install Phi Silica, which can be a large
+    /// download: obtain the user's consent first. Backends whose model is
+    /// prepared by the system (Apple) or by the provider (inference snaps)
+    /// just report their availability. No other call ever triggers a download.
+    pub async fn prepare(&self) -> Result<Availability> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(LocalAiError::ModelClosed);
+        }
+        self.backend.prepare().await
+    }
+
     pub async fn open_session(&self, instructions: Option<&str>) -> Result<LocalAiSession> {
         if self.closed.load(Ordering::Acquire) {
             return Err(LocalAiError::ModelClosed);

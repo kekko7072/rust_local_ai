@@ -37,27 +37,14 @@ impl Backend for UnsupportedBackend {
 }
 
 fn platform_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Apple Foundation Models (adapter unavailable in this build)"
-    } else if cfg!(target_os = "windows") {
-        "Windows AI (adapter unavailable in this build)"
-    } else if cfg!(target_os = "linux") {
-        "Linux (no managed provider detected)"
-    } else {
-        "Unsupported operating system"
-    }
+    "Unsupported operating system"
 }
 
 fn reason() -> AvailabilityReason {
-    if cfg!(any(target_os = "macos", target_os = "windows")) {
-        AvailabilityReason::UnsupportedOsVersion
-    } else if cfg!(target_os = "linux") {
-        AvailabilityReason::ProviderNotInstalled
-    } else {
-        AvailabilityReason::UnsupportedOperatingSystem
-    }
+    AvailabilityReason::UnsupportedOperatingSystem
 }
 
 fn detail() -> &'static str {
-    "No working OS-managed adapter is compiled; rust_local_ai never downloads a model automatically"
+    "rust_local_ai has adapters for macOS, Windows and Linux; on other systems use \
+     rust_local_ai::openai_compatible with a local provider"
 }

@@ -8,6 +8,8 @@ pub enum BackendKind {
     WindowsAi,
     UbuntuInferenceSnap,
     LinuxProvider,
+    /// An explicitly configured local service speaking the OpenAI API.
+    OpenAiCompatible,
     Fake,
     Unsupported,
 }

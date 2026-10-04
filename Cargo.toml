@@ -10,7 +10,7 @@ repository = "https://github.com/kekko7072/rust_local_ai"
 homepage = "https://vezz.io"
 documentation = "https://docs.rs/rust_local_ai"
 readme = "README.md"
-keywords = ["ai", "local-ai", "on-device", "genui", "a2ui"]
+keywords = ["ai", "local-ai", "on-device", "genui", "ubuntu"]
 categories = ["api-bindings", "os"]
 include = ["src/**", "native/**", "examples/**", "tests/**", "build.rs", "README.md", "LICENSE-*", "Cargo.toml"]
 
@@ -29,6 +29,10 @@ futures-core = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[target.'cfg(windows)'.dependencies]
+# Runtime for the generated Phi Silica bindings (src/backend/windows/bindings.rs).
+windows-core = "0.61"
 
 [dev-dependencies]
 futures-util = "0.3"

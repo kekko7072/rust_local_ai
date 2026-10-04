@@ -79,6 +79,7 @@ potential.
 | Streaming | — | — | — | — | ✓ |
 | Structured output | — | — | — | — | ✓ |
 | Tool calling | — | — | — | — | — |
+| Generative UI (`genui`) | beta | — | — | — | ✓ |
 | Token counting | beta (26.4+) | — | — | — | ✓ |
 | Cancellation | beta | — | — | — | ✓ |
 | Concurrent sessions | beta | — | — | — | ✓ |
@@ -95,18 +96,105 @@ On Linux there is deliberately no fictional universal backend. Provider
 selection will prefer distribution-managed infrastructure such as Canonical
 Inference Snaps, then supported providers already installed by the user.
 
+## Dependencies and runtimes
+
+The crate keeps its dependency tree small. At runtime it uses only `serde`,
+`serde_json`, `futures-core`, `tokio` (with only its `sync` feature) and the
+`async-trait` macro. The `a2ui` feature adds `a2ui-types`.
+
+It doesn't need a tokio runtime and works under any async executor. Native
+calls run on their own threads rather than a runtime's blocking pool. Dropping
+a generation future cancels the native generation, and the native session
+stays alive until that call returns.
+
 ## Testing adapters
 
 Enable the `testing` feature to use `rust_local_ai::testing::FakeBackend` in
 downstream contract tests. It supports deterministic responses, streams,
 failures, cancellation, and close-retry testing without OS AI hardware.
 
-## Generative UI and Node
+## Generative UI
 
-The inference core has no UI-framework dependency. Future optional GenUI
-interoperability will carry structured representations to A2UI, AG-UI, MCP Apps,
-or Rust projects such as `adk-ui`. A future N-API crate can wrap this same core
-for Electron without reimplementing native adapters in TypeScript.
+Enable the `genui` feature to turn a natural-language goal into a small,
+renderable UI module on-device. It is a port of the genUI engine in
+[`flutter_local_ai`](https://pub.dev/packages/flutter_local_ai), with the same
+typed-block schema, system instructions and tolerant parser. A module made by
+either package renders the same way in both.
+
+```toml
+[dependencies]
+rust_local_ai = { version = "0.1", features = ["genui"] }  # or "a2ui"
+```
+
+```rust,ignore
+use rust_local_ai::{detect, genui::{GenUiOptions, LocalAiUiGenerator}};
+
+let generator = LocalAiUiGenerator::new(detect().await?);
+let module = generator
+    .generate_module(
+        "Save $500 for a weekend trip",
+        &GenUiOptions {
+            principles: Some("Keep it simple and low-pressure".into()),
+            language: Some("Italian".into()),
+            ..GenUiOptions::default()
+        },
+    )
+    .await?; // LocalAiError::InvalidModelOutput lets you fall back to a fixed UI
+
+println!("{}", module.title);            // e.g. "Weekend trip fund"
+let json = module.to_module_json();      // flutter_local_ai module shape
+let tree = module.to_component_maps();   // renderer-neutral component tree
+```
+
+A `GenUiModuleSpec` is a stack of typed blocks (`amount`, `progress`,
+`checklist`, `week`, `stat`, `list`, `lessons`, `reminder`, `calc`, `docs`,
+`note`). Each module runs in its own short-lived session, so it does not touch
+ongoing chats. Generation uses a 900-token budget, and its output is checked in
+several ways before it is returned:
+
+- The parser handles code fences, surrounding prose, trailing commas, stray
+  braces and wrapper objects. It repairs output cut off by the token budget,
+  so a partial module still renders. It never panics and runs in linear time
+  (both are covered by fuzz-style tests).
+- Numbers written as strings (`"$1,200"`) are converted to JSON numbers.
+  Unknown blocks are dropped, and missing fields get defaults.
+- When the output can't be used, generation is retried once with a stricter
+  compact prompt (`GenUiOptions::max_attempts`, default 2). Backend errors and
+  cancellation are returned immediately and never retried.
+- Backends that support structured output are constrained to the module's JSON
+  Schema.
+
+`generate_module_with_progress` streams the raw text as it decodes, for live
+previews.
+
+To drive the same generation with any other model, send
+`genui::GENUI_INSTRUCTIONS` as its system prompt and pass its raw text to
+`genui::parse_model_output`.
+
+### A2UI interoperability
+
+The `a2ui` feature (it also enables `genui`) turns a module into
+[A2UI](https://a2ui.org) v0.9 protocol messages, typed with the
+[`a2ui-types`](https://crates.io/crates/a2ui-types) crate. Any A2UI renderer
+can display them, including Flutter's `genui`, the web renderers, or Rust
+renderers such as the [`a2ui`](https://crates.io/crates/a2ui) crate
+(ratatui, egui, Iced, Bevy, and more):
+
+```rust,ignore
+use rust_local_ai::genui::A2UI_V09_BASIC_CATALOG_ID;
+
+// createSurface, updateComponents, updateDataModel (the full module)
+for message in module.to_a2ui_v09_messages("trip", A2UI_V09_BASIC_CATALOG_ID) {
+    println!("{}", serde_json::to_string(&message)?); // JSONL stream
+}
+```
+
+See [`examples/genui.rs`](examples/genui.rs)
+(`cargo run --example genui --features a2ui`).
+
+The inference core has no UI-framework dependency. A future N-API crate can
+wrap this same core for Electron without reimplementing native adapters in
+TypeScript.
 
 ## License
 

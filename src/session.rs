@@ -8,7 +8,6 @@ use std::{
 };
 
 use futures_core::Stream;
-use pin_project_lite::pin_project;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -155,17 +154,16 @@ impl Drop for GenerationLease {
     }
 }
 
-pin_project! {
-    struct LeaseStream {
-        #[pin]
-        stream: ResponseStream,
-        _lease: GenerationLease,
-    }
+/// Keeps the session's generation lease alive until the stream is dropped.
+struct LeaseStream {
+    stream: ResponseStream,
+    _lease: GenerationLease,
 }
 
 impl Stream for LeaseStream {
     type Item = Result<String>;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().stream.poll_next(cx)
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // `ResponseStream` is a `Pin<Box<_>>`, so `LeaseStream` is `Unpin`.
+        self.stream.as_mut().poll_next(cx)
     }
 }

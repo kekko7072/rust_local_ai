@@ -2,14 +2,17 @@
 
 use std::{
     collections::VecDeque,
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
+    task::{Context, Poll},
 };
 
 use async_trait::async_trait;
-use futures_util::stream;
+use futures_core::Stream;
 
 use crate::{
     AiResponse, Availability, Backend, BackendInfo, BackendKind, BackendSession, Capabilities,
@@ -123,7 +126,7 @@ impl BackendSession for FakeSession {
 
     async fn generate(&self, _: GenerationConfig) -> Result<AiResponse> {
         while self.state.generation_blocked.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
+            YieldNow(false).await;
         }
         if self.cancelled.swap(false, Ordering::AcqRel) {
             return Err(LocalAiError::Cancelled);
@@ -139,7 +142,7 @@ impl BackendSession for FakeSession {
 
     async fn generate_stream(&self, _: GenerationConfig) -> Result<ResponseStream> {
         let chunks = std::mem::take(&mut *self.state.stream_chunks.lock().expect("fake lock"));
-        Ok(Box::pin(stream::iter(chunks)))
+        Ok(Box::pin(IterStream(chunks.into_iter())))
     }
 
     async fn cancel(&self) -> Result<()> {
@@ -160,5 +163,30 @@ impl BackendSession for FakeSession {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Yields to the executor once, without depending on a specific runtime.
+struct YieldNow(bool);
+
+impl Future for YieldNow {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+struct IterStream(std::vec::IntoIter<Result<String>>);
+
+impl Stream for IterStream {
+    type Item = Result<String>;
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.0.next())
     }
 }

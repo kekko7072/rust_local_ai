@@ -9,8 +9,9 @@ configured installed provider. It never silently downloads a model, installs a
 provider, or starts a heavyweight inference service.
 
 > This crate is early `0.x` software. The portable API and fake backend are
-> implemented and tested. Native adapters are under active development; the
-> current release reports them unavailable instead of advertising placeholders.
+> implemented and tested. The macOS adapter currently implements availability,
+> sessions, text generation, cancellation, and token counting (macOS 26.4+).
+> Remaining native adapters are under active development.
 
 ## Installation
 
@@ -73,14 +74,22 @@ potential.
 
 | Capability | Apple | Windows | Ubuntu | Other Linux providers | Fake/test backend |
 |---|---:|---:|---:|---:|---:|
-| Availability detection | planned | planned | planned | planned | ✓ |
-| Text generation | — | — | — | — | ✓ |
+| Availability detection | ✓ | planned | planned | planned | ✓ |
+| Text generation | beta | — | — | — | ✓ |
 | Streaming | — | — | — | — | ✓ |
 | Structured output | — | — | — | — | ✓ |
 | Tool calling | — | — | — | — | — |
-| Token counting | — | — | — | — | ✓ |
-| Cancellation | — | — | — | — | ✓ |
-| System-managed model | intended | intended | intended | varies | no |
+| Token counting | beta (26.4+) | — | — | — | ✓ |
+| Cancellation | beta | — | — | — | ✓ |
+| Concurrent sessions | beta | — | — | — | ✓ |
+| System-managed model | ✓ | intended | intended | varies | no |
+
+The Apple adapter is a thin Swift C-ABI bridge to `FoundationModels`; it does
+not bundle a model. It compiles to an unavailable fallback with older Apple
+SDKs, and runtime availability distinguishes old OS versions, ineligible
+hardware, disabled Apple Intelligence, and a model that is still preparing.
+The hardware integration test is ignored in ordinary CI and can be run with
+`cargo test --test apple_integration -- --ignored` on a configured Mac.
 
 On Linux there is deliberately no fictional universal backend. Provider
 selection will prefer distribution-managed infrastructure such as Canonical

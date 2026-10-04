@@ -29,5 +29,13 @@ pub trait BackendSession: Send + Sync {
     async fn close(&self) -> Result<()>;
 }
 
+#[cfg(not(target_os = "macos"))]
 mod unsupported;
+
+#[cfg(target_os = "macos")]
+mod apple;
+
+#[cfg(target_os = "macos")]
+pub(crate) use apple::platform_backend;
+#[cfg(not(target_os = "macos"))]
 pub(crate) use unsupported::platform_backend;

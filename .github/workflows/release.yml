@@ -1,0 +1,13 @@
+name: Release checks
+on:
+  release:
+    types: [published]
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-features
+      - run: cargo package
+      # Publishing remains deliberately manual until release policy is finalized.

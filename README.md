@@ -18,7 +18,7 @@ provider, or starts a heavyweight inference service.
 
 ```toml
 [dependencies]
-rust_local_ai = "0.1"
+rust_local_ai = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3"
 ```
@@ -188,7 +188,7 @@ either package renders the same way in both.
 
 ```toml
 [dependencies]
-rust_local_ai = { version = "0.1", features = ["genui"] }  # or "a2ui"
+rust_local_ai = { version = "0.2", features = ["genui"] }  # or "a2ui"
 ```
 
 ```rust,ignore

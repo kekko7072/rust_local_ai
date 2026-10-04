@@ -1,6 +1,6 @@
 [package]
 name = "rust_local_ai"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "A unified Rust interface to AI capabilities provided or managed by the operating system"
@@ -12,7 +12,7 @@ documentation = "https://docs.rs/rust_local_ai"
 readme = "README.md"
 keywords = ["ai", "local-ai", "on-device", "genui", "ubuntu"]
 categories = ["api-bindings", "os"]
-include = ["src/**", "native/**", "examples/**", "tests/**", "build.rs", "README.md", "LICENSE-*", "Cargo.toml"]
+include = ["src/**", "native/**", "examples/**", "tests/**", "build.rs", "README.md", "CHANGELOG.md", "LICENSE-*", "Cargo.toml"]
 
 [features]
 default = []

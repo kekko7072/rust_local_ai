@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+### Fixed
+- Fix `cancel()` not stopping a generation on Windows for the
+  OpenAI-compatible and inference-snap backends. Shutting a socket down from
+  another thread does not wake a blocked read on Windows, so the HTTP client
+  now reads in short intervals, checks an abort flag in between, and still
+  honours the full idle timeout.
+
 ## 0.2.0
 
 ### Added

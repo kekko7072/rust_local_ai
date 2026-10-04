@@ -6,7 +6,6 @@
 
 use std::{
     io::{BufRead, BufReader, Read},
-    net::TcpStream,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -173,8 +172,8 @@ struct Shared {
     model: String,
     kind: BackendKind,
     transcript: Mutex<Transcript>,
-    /// The socket of the generation in flight, so `cancel` can abort it.
-    active: Mutex<Option<TcpStream>>,
+    /// The request in flight, so `cancel` can abort it.
+    active: Mutex<Option<http::Abort>>,
     cancelled: AtomicBool,
 }
 
@@ -252,11 +251,11 @@ impl Shared {
                 "/chat/completions",
                 Some(body),
                 GENERATION_IDLE_TIMEOUT,
-                &mut |stream| {
-                    *self.active.lock().expect("active lock") = stream.try_clone().ok();
-                    // A cancel that arrived before the socket was registered.
+                &mut |abort| {
+                    *self.active.lock().expect("active lock") = Some(abort.clone());
+                    // A cancel that arrived before the request was registered.
                     if self.cancelled.load(Ordering::Acquire) {
-                        http::abort(stream);
+                        abort.abort();
                     }
                 },
             )
@@ -275,8 +274,8 @@ impl Shared {
     /// Marks the generation in flight as cancelled and aborts its socket.
     fn abort(&self) {
         self.cancelled.store(true, Ordering::Release);
-        if let Some(stream) = self.active.lock().expect("active lock").as_ref() {
-            http::abort(stream);
+        if let Some(abort) = self.active.lock().expect("active lock").as_ref() {
+            abort.abort();
         }
     }
 

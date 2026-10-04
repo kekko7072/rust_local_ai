@@ -9,7 +9,11 @@
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 /// Largest response head (status line and headers) accepted.
@@ -17,6 +21,11 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Largest buffered (non-streaming) body accepted.
 pub(crate) const MAX_BODY_BYTES: u64 = 32 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often a blocked read wakes up to check for [`Abort::abort`].
+///
+/// Shutting a socket down from another thread wakes a blocked `recv` on Linux
+/// and macOS but not on Windows, so reads never block longer than this.
+const ABORT_POLL: Duration = Duration::from_millis(50);
 
 /// A parsed `http://host[:port][/base]` URL pointing at this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,22 +87,32 @@ impl Endpoint {
 
     /// Sends one request to `base_path + path` and reads the response head.
     ///
-    /// `on_connected` receives the socket as soon as it is open, before the
-    /// request is written, so a caller can abort the exchange (with [`abort`])
-    /// while it is blocked waiting for the response.
+    /// `on_connected` receives an [`Abort`] handle as soon as the socket is
+    /// open, before the request is written, so a caller can abort the exchange
+    /// from another thread while it is blocked waiting for the response.
+    /// `read_timeout` is the longest the server may stay silent.
     pub(crate) fn send(
         &self,
         method: &str,
         path: &str,
         body: Option<&[u8]>,
         read_timeout: Duration,
-        on_connected: &mut dyn FnMut(&TcpStream),
+        on_connected: &mut dyn FnMut(&Abort),
     ) -> io::Result<Response> {
         let stream = self.connect()?;
-        on_connected(&stream);
-        stream.set_read_timeout(Some(read_timeout))?;
+        let abort = Abort {
+            flag: Arc::new(AtomicBool::new(false)),
+            socket: stream.try_clone().ok().map(Arc::new),
+        };
+        on_connected(&abort);
+        stream.set_read_timeout(Some(ABORT_POLL.min(read_timeout)))?;
         stream.set_write_timeout(Some(read_timeout))?;
         stream.set_nodelay(true)?;
+        let stream = Conn {
+            stream,
+            aborted: abort.flag,
+            idle_timeout: read_timeout,
+        };
 
         let mut head = format!(
             "{method} {}{path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: rust_local_ai/{}\r\n\
@@ -109,12 +128,12 @@ impl Endpoint {
             ));
         }
         head.push_str("\r\n");
-        let mut writer = &stream;
-        writer.write_all(head.as_bytes())?;
+        let mut stream = stream;
+        stream.write_all(head.as_bytes())?;
         if let Some(body) = body {
-            writer.write_all(body)?;
+            stream.write_all(body)?;
         }
-        writer.flush()?;
+        stream.flush()?;
 
         let mut reader = BufReader::new(stream);
         let (status, framing) = read_head(&mut reader)?;
@@ -245,14 +264,91 @@ impl Response {
     }
 }
 
-/// Aborts any read or write blocked on the socket.
-pub(crate) fn abort(control: &TcpStream) {
-    let _ = control.shutdown(Shutdown::Both);
+/// Aborts one request from another thread.
+#[derive(Clone)]
+pub(crate) struct Abort {
+    flag: Arc<AtomicBool>,
+    /// A clone of the socket, shut down to wake a blocked read immediately on
+    /// platforms where that works; elsewhere the read notices within
+    /// [`ABORT_POLL`].
+    socket: Option<Arc<TcpStream>>,
+}
+
+impl Abort {
+    /// Makes any read blocked on, or later issued for, this request fail.
+    pub(crate) fn abort(&self) {
+        self.flag.store(true, Ordering::Release);
+        if let Some(socket) = &self.socket {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// A socket whose reads time out after `idle_timeout` of silence and fail
+/// promptly once aborted, independent of the platform's socket semantics.
+struct Conn {
+    stream: TcpStream,
+    aborted: Arc<AtomicBool>,
+    idle_timeout: Duration,
+}
+
+impl Conn {
+    fn check_aborted(&self) -> io::Result<()> {
+        if self.aborted.load(Ordering::Acquire) {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "request aborted",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let started = Instant::now();
+        loop {
+            self.check_aborted()?;
+            match self.stream.read(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if started.elapsed() >= self.idle_timeout {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "the server sent nothing before the timeout",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                result => {
+                    // A shutdown from `Abort` surfaces as EOF or a reset.
+                    self.check_aborted()?;
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.check_aborted()?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 /// A response body with its framing (length, chunked or until close) decoded.
 pub(crate) struct Body {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<Conn>,
     framing: Framing,
     chunk_left: u64,
     done: bool,
@@ -477,5 +573,92 @@ pub(crate) mod tests {
         assert!(endpoint
             .send("GET", "/", None, Duration::from_secs(1), &mut |_| {})
             .is_err());
+    }
+
+    /// A server that accepts the request and then never answers.
+    fn silent_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut byte = [0; 1];
+            // Hold the connection open until the client goes away.
+            while matches!((&stream).read(&mut byte), Ok(1)) {}
+        });
+        (url, handle)
+    }
+
+    /// Sends to a silent server, aborting through `make_handle(abort)` after
+    /// 200 ms, and returns the error and how long the request blocked.
+    fn abort_silent_request(
+        make_handle: fn(&Abort) -> Abort,
+        idle_timeout: Duration,
+    ) -> (io::Error, Duration) {
+        let (url, server) = silent_server();
+        let started = Instant::now();
+        let error = Endpoint::parse(&url)
+            .unwrap()
+            .send(
+                "POST",
+                "/chat/completions",
+                Some(b"{}"),
+                idle_timeout,
+                &mut |abort| {
+                    let handle = make_handle(abort);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(200));
+                        handle.abort();
+                    });
+                },
+            )
+            .err()
+            .expect("an aborted request must fail");
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        (error, elapsed)
+    }
+
+    #[test]
+    fn abort_unblocks_a_request_waiting_for_the_server() {
+        let (error, elapsed) = abort_silent_request(Abort::clone, Duration::from_secs(600));
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted, "{error}");
+        assert!(elapsed < Duration::from_secs(5), "abort took {elapsed:?}");
+    }
+
+    #[test]
+    fn abort_works_even_when_shutdown_does_not_wake_the_read() {
+        // On Windows, shutting the socket down from another thread does not
+        // wake a blocked read. Abort through the flag alone to prove the
+        // polling path unblocks the request on every platform.
+        fn flag_only(abort: &Abort) -> Abort {
+            Abort {
+                flag: abort.flag.clone(),
+                socket: None,
+            }
+        }
+        let (error, elapsed) = abort_silent_request(flag_only, Duration::from_secs(600));
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted, "{error}");
+        assert!(elapsed < Duration::from_secs(5), "abort took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_silent_server_still_times_out() {
+        let (url, server) = silent_server();
+        let started = Instant::now();
+        let error = Endpoint::parse(&url)
+            .unwrap()
+            .send(
+                "GET",
+                "/models",
+                None,
+                Duration::from_millis(300),
+                &mut |_| {},
+            )
+            .err()
+            .expect("a silent server must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(error);
+        server.join().unwrap();
     }
 }

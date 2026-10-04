@@ -1,7 +1,14 @@
 name: Release
 
-# Publishes the crate to crates.io when a GitHub release is published.
-# The release tag must match the version in Cargo.toml (`v0.2.0` or `0.2.0`).
+# Releases rust_local_ai from main. Bump `version` in Cargo.toml and add a
+# `## <version>` entry to CHANGELOG.md; when that merges, this workflow tests
+# the crate, publishes it to crates.io and creates the GitHub release
+# `v<version>` with that changelog entry and the packaged .crate attached.
+# A push whose version is already on crates.io, or already tagged, does
+# nothing.
+#
+# Publishing a GitHub release by hand still works: the tag must match
+# Cargo.toml (`v0.2.1` or `0.2.1`), and the .crate is attached to it.
 #
 # Authentication uses crates.io trusted publishing (OIDC): configure it in the
 # crate's crates.io settings for this repository, workflow `release.yml` and
@@ -13,6 +20,8 @@ name: Release
 # packages and verifies the crate without uploading it.
 
 on:
+  push:
+    branches: [main]
   release:
     types: [published]
   workflow_dispatch:
@@ -26,9 +35,58 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
+  plan:
+    name: Plan the release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      run: ${{ steps.plan.outputs.run }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          run=true publish=true tag="v$version"
+          case "$EVENT" in
+            release)
+              tag="$RELEASE_TAG"
+              if [ "${RELEASE_TAG#v}" != "$version" ]; then
+                echo "::error::Release tag '$RELEASE_TAG' does not match Cargo.toml version '$version'"
+                exit 1
+              fi ;;
+            workflow_dispatch)
+              [ "$DRY_RUN" = "false" ] || publish=false ;;
+            push)
+              status=$(curl -s -o /dev/null -w '%{http_code}' -A 'rust_local_ai release workflow' \
+                "https://crates.io/api/v1/crates/rust_local_ai/$version")
+              if [ "$status" = 200 ]; then
+                echo "::notice::rust_local_ai $version is already on crates.io; nothing to release."
+                run=false publish=false
+              elif git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+                echo "::notice::$tag is already tagged; its release owns the publish."
+                run=false publish=false
+              fi ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "version=$version tag=$tag run=$run publish=$publish"
+
   test:
     name: Test (${{ matrix.os }})
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -39,8 +97,8 @@ jobs:
       - run: cargo test --locked --all-features
 
   publish:
-    name: Publish to crates.io
-    needs: test
+    name: ${{ needs.plan.outputs.publish == 'true' && 'Publish to crates.io' || 'Publish dry run' }}
+    needs: [plan, test]
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
@@ -50,31 +108,27 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Check release tag matches Cargo.toml version
-        if: github.event_name == 'release'
-        env:
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "rust_local_ai") | .version')
-          if [ "${TAG#v}" != "$version" ]; then
-            echo "::error::Release tag '$TAG' does not match Cargo.toml version '$version'"
-            exit 1
-          fi
+      - name: Package the crate
+        run: cargo package --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crate
+          path: target/package/*.crate
 
       - name: Dry run
-        if: github.event_name == 'workflow_dispatch' && inputs.dry-run
+        if: needs.plan.outputs.publish != 'true'
         run: cargo publish --dry-run --locked
 
       - name: Get a short-lived crates.io token (trusted publishing)
         id: auth
-        if: github.event_name == 'release' || !inputs.dry-run
+        if: needs.plan.outputs.publish == 'true'
         # Falls back to the stored secret when trusted publishing is not set up.
         continue-on-error: true
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish
-        if: github.event_name == 'release' || !inputs.dry-run
+        if: needs.plan.outputs.publish == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -83,3 +137,34 @@ jobs:
             exit 1
           fi
           cargo publish --locked
+
+  github-release:
+    name: GitHub release
+    needs: [plan, publish]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and release, upload assets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: crate
+          path: dist
+      - name: Create the release, or attach assets to the one being published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          bash .github/scripts/release-notes.sh "$VERSION" CHANGELOG.md > notes.md
+          cat notes.md
+          if [ "$EVENT" = release ]; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "rust_local_ai $VERSION" \
+              --notes-file notes.md
+          fi
